@@ -1,0 +1,108 @@
+name: fetch-p3-adreno
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 1. 解析 Pixel3 blueline factory image 直链
+        run: |
+          set -e
+          curl -sL --retry 3 "https://developers.google.com/android/images" -o imgs.html
+          grep -oE 'https://dl\.google\.com/dl/android/aosp/blueline-[a-z0-9._]+-factory-[0-9a-f]+\.zip' imgs.html | sort -u > urls.txt
+          echo "--- blueline Android 12 候选 ---"
+          grep -E 'sp[12]a' urls.txt || true
+          URL=$(grep -E 'blueline-sp2a' urls.txt | head -1)
+          if [ -z "$URL" ]; then URL=$(grep -E 'blueline-sp1a' urls.txt | head -1); fi
+          if [ -z "$URL" ]; then echo "!! 没解析到 Android 12 镜像"; cat urls.txt; exit 1; fi
+          echo "选中: $URL"
+          echo "FAC_URL=$URL" >> $GITHUB_ENV
+
+      - name: 2. 下载 factory 包
+        run: |
+          curl -L --retry 5 --retry-delay 3 -o fac.zip "$FAC_URL"
+          ls -lh fac.zip
+
+      - name: 3. 解出 vendor.img
+        run: |
+          set -e
+          unzip -q fac.zip -d fac
+          IMG=$(find fac -name 'image-blueline-*.zip' | head -1)
+          echo "image zip: $IMG"
+          unzip -q -o "$IMG" vendor.img -d fac
+          ls -lh fac/vendor.img
+          file fac/vendor.img
+
+      - name: 4. 从 ext4 直接 dump Adreno 用户态驱动
+        run: |
+          set -e
+          mkdir -p out
+          for f in \
+            lib64/egl/libEGL_adreno.so \
+            lib64/egl/libGLESv1_CM_adreno.so \
+            lib64/egl/libGLESv2_adreno.so \
+            lib64/egl/libq3dtools_adreno.so \
+            lib64/libgsl.so \
+            lib64/libadreno_utils.so \
+            lib64/libCB.so \
+            lib64/libllvm-glnext.so \
+            lib64/librs_adreno.so \
+            lib64/libRSDriver_adreno.so ; do
+            n=$(basename "$f")
+            if debugfs -R "dump /$f out/$n" fac/vendor.img >/dev/null 2>&1; then
+              echo "OK   $n"
+            else
+              echo "MISS $f"
+            fi
+          done
+          echo "--- 体积 ---"
+          ls -l out
+          echo "--- sha256 ---"
+          sha256sum out/* | tee out.sha256
+
+      - name: 5. 验证版本串 + 打包 + 1MB 切块
+        run: |
+          set -e
+          python3 - <<'EOF'
+          d = open('out/libGLESv2_adreno.so','rb').read()
+          i = d.find(b'V@')
+          print('驱动版本串:', d[i:i+70].decode('utf-8','replace'))
+          EOF
+          tar -C out -czf p3blob.tar.gz .
+          ls -lh p3blob.tar.gz
+          sha256sum p3blob.tar.gz | tee p3blob.tar.gz.sha256
+          rm -rf parts && mkdir -p parts
+          split -b 1M -d -a 4 p3blob.tar.gz parts/p3blob.tar.gz.
+          echo "块数: $(ls parts | wc -l)"
+          ls -l parts | head -5
+
+      - name: 6. 推分块到私有仓库
+        env:
+          STORE_TOKEN: ${{ secrets.STORE_TOKEN }}
+        run: |
+          set -e
+          git config --global user.name "p3-blob-bot"
+          git config --global user.email "bot@localhost"
+          git clone "https://x-access-token:${STORE_TOKEN}@github.com/AnZhuoHub/p3-blob-store.git" store
+          cd store
+          git checkout -B main
+          rm -rf parts old
+          mkdir -p parts
+          cp ../parts/* parts/
+          cp ../p3blob.tar.gz.sha256 ./p3blob.tar.gz.sha256
+          cp ../out.sha256 ./out.sha256
+          cp ../urls.txt ./urls.txt || true
+          echo "FAC_URL=${FAC_URL}" > source.txt
+          date -u >> source.txt
+          git add -A
+          git commit -m "blueline adreno490 blobs $(date -u +%Y%m%d-%H%M)" || echo "nothing to commit"
+          git push origin HEAD:main
+          echo "== 推送完成 =="
