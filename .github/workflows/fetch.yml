@@ -16,13 +16,33 @@ jobs:
       - name: 1. 解析 Pixel3 blueline factory image 直链
         run: |
           set -e
-          curl -sL --retry 3 "https://developers.google.com/android/images" -o imgs.html
-          grep -oE 'https://dl\.google\.com/dl/android/aosp/blueline-[a-z0-9._]+-factory-[0-9a-f]+\.zip' imgs.html | sort -u > urls.txt
-          echo "--- blueline Android 12 候选 ---"
-          grep -E 'sp[12]a' urls.txt || true
-          URL=$(grep -E 'blueline-sp2a' urls.txt | head -1)
-          if [ -z "$URL" ]; then URL=$(grep -E 'blueline-sp1a' urls.txt | head -1); fi
-          if [ -z "$URL" ]; then echo "!! 没解析到 Android 12 镜像"; cat urls.txt; exit 1; fi
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          curl -sL --compressed -A "$UA" "https://developers.google.com/android/images?hl=en" -o imgs.html || true
+          echo "页面字节: $(wc -c < imgs.html)"
+          echo "含 blueline 次数: $(grep -c blueline imgs.html || true)"
+          grep -oE 'https://dl\.google\.com/dl/android/aosp/blueline-[a-z0-9._]+-factory-[0-9a-f]+\.zip' imgs.html | sort -u > urls.txt || true
+          echo "解析到条数: $(wc -l < urls.txt)"
+          grep -E 'blueline-sp[12]a' urls.txt | head -5 || true
+
+          URL=$(grep -E 'blueline-sp2a' urls.txt | head -1 || true)
+          if [ -z "$URL" ]; then URL=$(grep -E 'blueline-sp1a' urls.txt | head -1 || true); fi
+
+          if [ -z "$URL" ]; then
+            echo "解析失败 -> 候选探测"
+            for c in \
+              "https://dl.google.com/dl/android/aosp/blueline-sp1a.210812.016.a2-factory-0e1330df.zip" \
+              "https://dl.google.com/dl/android/aosp/blueline-sp1a.210812.016-factory-0e1330df.zip" ; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -I -A "$UA" "$c" || echo 000)
+              echo "  $code  $c"
+              if [ "$code" = "200" ]; then URL="$c"; break; fi
+            done
+          fi
+
+          if [ -z "$URL" ]; then
+            echo "!! 仍然没有可用直链，打印页面头部供诊断"
+            head -c 1500 imgs.html
+            exit 1
+          fi
           echo "选中: $URL"
           echo "FAC_URL=$URL" >> $GITHUB_ENV
 
