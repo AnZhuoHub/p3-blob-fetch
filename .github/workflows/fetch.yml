@@ -18,31 +18,22 @@ jobs:
           set -e
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
           curl -sL --compressed -A "$UA" "https://developers.google.com/android/images?hl=en" -o imgs.html || true
-          echo "页面字节: $(wc -c < imgs.html)"
-          echo "含 blueline 次数: $(grep -c blueline imgs.html || true)"
           grep -oE 'https://dl\.google\.com/dl/android/aosp/blueline-[a-z0-9._]+-factory-[0-9a-f]+\.zip' imgs.html | sort -u > urls.txt || true
-          echo "解析到条数: $(wc -l < urls.txt)"
-          grep -E 'blueline-sp[12]a' urls.txt | head -5 || true
+          echo "页面解析到条数: $(wc -l < urls.txt)"
 
           URL=$(grep -E 'blueline-sp2a' urls.txt | head -1 || true)
           if [ -z "$URL" ]; then URL=$(grep -E 'blueline-sp1a' urls.txt | head -1 || true); fi
 
           if [ -z "$URL" ]; then
-            echo "解析失败 -> 候选探测"
+            echo "页面解析为空 -> 用候选直链探测"
             for c in \
-              "https://dl.google.com/dl/android/aosp/blueline-sp1a.210812.016.a2-factory-0e1330df.zip" \
-              "https://dl.google.com/dl/android/aosp/blueline-sp1a.210812.016-factory-0e1330df.zip" ; do
+              "https://dl.google.com/dl/android/aosp/blueline-sp1a.210812.016.a2-factory-0e1330df.zip" ; do
               code=$(curl -sS -o /dev/null -w '%{http_code}' -I -A "$UA" "$c" || echo 000)
               echo "  $code  $c"
               if [ "$code" = "200" ]; then URL="$c"; break; fi
             done
           fi
-
-          if [ -z "$URL" ]; then
-            echo "!! 仍然没有可用直链，打印页面头部供诊断"
-            head -c 1500 imgs.html
-            exit 1
-          fi
+          if [ -z "$URL" ]; then echo "!! 无可用直链"; exit 1; fi
           echo "选中: $URL"
           echo "FAC_URL=$URL" >> $GITHUB_ENV
 
@@ -51,15 +42,24 @@ jobs:
           curl -L --retry 5 --retry-delay 3 -o fac.zip "$FAC_URL"
           ls -lh fac.zip
 
-      - name: 3. 解出 vendor.img
+      - name: 3. 解出 vendor.img 并转 raw
         run: |
           set -e
           unzip -q fac.zip -d fac
           IMG=$(find fac -name 'image-blueline-*.zip' | head -1)
           echo "image zip: $IMG"
           unzip -q -o "$IMG" vendor.img -d fac
-          ls -lh fac/vendor.img
           file fac/vendor.img
+          if file fac/vendor.img | grep -qi 'android sparse'; then
+            echo "sparse -> raw"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq android-sdk-libsparse-utils
+            simg2img fac/vendor.img fac/vendor.raw.img
+          else
+            cp fac/vendor.img fac/vendor.raw.img
+          fi
+          ls -lh fac/vendor.raw.img
+          file fac/vendor.raw.img
 
       - name: 4. 从 ext4 直接 dump Adreno 用户态驱动
         run: |
@@ -77,32 +77,29 @@ jobs:
             lib64/librs_adreno.so \
             lib64/libRSDriver_adreno.so ; do
             n=$(basename "$f")
-            if debugfs -R "dump /$f out/$n" fac/vendor.img >/dev/null 2>&1; then
-              echo "OK   $n"
+            rm -f "out/$n"
+            debugfs -R "dump /$f out/$n" fac/vendor.raw.img >/dev/null 2>&1 || true
+            if [ -s "out/$n" ]; then
+              echo "OK   $n  $(stat -c%s "out/$n")"
             else
               echo "MISS $f"
             fi
           done
-          echo "--- 体积 ---"
-          ls -l out
-          echo "--- sha256 ---"
+          echo "--- 总计 ---"
+          du -sh out
           sha256sum out/* | tee out.sha256
 
       - name: 5. 验证版本串 + 打包 + 1MB 切块
         run: |
           set -e
-          python3 - <<'EOF'
-          d = open('out/libGLESv2_adreno.so','rb').read()
-          i = d.find(b'V@')
-          print('驱动版本串:', d[i:i+70].decode('utf-8','replace'))
-          EOF
+          echo "驱动版本串:"
+          grep -aoE 'V@[0-9]{3,4}\.[0-9][^)]*\)' out/libGLESv2_adreno.so | head -3
           tar -C out -czf p3blob.tar.gz .
           ls -lh p3blob.tar.gz
           sha256sum p3blob.tar.gz | tee p3blob.tar.gz.sha256
           rm -rf parts && mkdir -p parts
           split -b 1M -d -a 4 p3blob.tar.gz parts/p3blob.tar.gz.
           echo "块数: $(ls parts | wc -l)"
-          ls -l parts | head -5
 
       - name: 6. 推分块到私有仓库
         env:
@@ -114,15 +111,14 @@ jobs:
           git clone "https://x-access-token:${STORE_TOKEN}@github.com/AnZhuoHub/p3-blob-store.git" store
           cd store
           git checkout -B main
-          rm -rf parts old
+          rm -rf parts imgs.html
           mkdir -p parts
           cp ../parts/* parts/
           cp ../p3blob.tar.gz.sha256 ./p3blob.tar.gz.sha256
           cp ../out.sha256 ./out.sha256
-          cp ../urls.txt ./urls.txt || true
           echo "FAC_URL=${FAC_URL}" > source.txt
           date -u >> source.txt
           git add -A
-          git commit -m "blueline adreno490 blobs $(date -u +%Y%m%d-%H%M)" || echo "nothing to commit"
+          git commit -m "blueline adreno blobs $(date -u +%Y%m%d-%H%M)" || echo "nothing to commit"
           git push origin HEAD:main
           echo "== 推送完成 =="
